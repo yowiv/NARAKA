@@ -20,6 +20,11 @@ import requests
 import os
 from typing import Optional, List, Dict, Any, Tuple
 
+try:
+    from notify import send as notify_send  # 青龙面板通知
+except Exception:
+    notify_send = None
+
 # =============================================================================
 # 配置
 # =============================================================================
@@ -32,6 +37,15 @@ _CARD_BOOK_ID_AUTO_LOGGED = False
 # 是否开启账号间互相送卡（True 开启，False 关闭）
 EXCHANGE_CARDS = os.environ.get("NARAKA_EXCHANGE_CARDS", "True").lower() == "true"
 # =============================================================================
+
+
+def send_notify(title: str, content: str) -> None:
+    if not notify_send:
+        return
+    try:
+        notify_send(title, content)
+    except Exception as e:
+        print(f"[notify] 发送失败: {e}")
 
 
 class DSAutomator:
@@ -154,11 +168,17 @@ class DSAutomator:
         # 4. 动态获取模块 ID (抽奖、卡片等)
         modules = self.get_act_modules()
         for m in modules:
-            m_type = m.get("asType")
             m_id = m.get("asId")
-            if m_type == 2:
+            if not m_id:
+                continue
+            try:
+                m_type_num = int(float(m.get("asType")))
+            except (TypeError, ValueError):
+                continue
+            # 小程序侧是 find(asType===2)，取第一个；这里也保持一致
+            if m_type_num == 2 and not self.luck_draw_as_id:
                 self.luck_draw_as_id = m_id
-            elif m_type == 43:
+            elif m_type_num == 43 and not self.card_as_id:
                 self.card_as_id = m_id
         
         self._initialized = True
@@ -305,7 +325,17 @@ class DSAutomator:
     def get_tasks(self):
         # 1. 动态获取所有模块并筛选任务模块 (asType=4)
         modules = self.get_act_modules()
-        task_as_ids = [m.get("asId") for m in modules if m.get("asType") == 4]
+        task_as_ids: List[str] = []
+        for m in modules:
+            as_id = m.get("asId")
+            if not as_id:
+                continue
+            try:
+                as_type_num = int(float(m.get("asType")))
+            except (TypeError, ValueError):
+                continue
+            if as_type_num == 4:
+                task_as_ids.append(as_id)
         
         if not task_as_ids:
             print(f"[{self.name}] 未在当前活动中找到任务模块")
@@ -314,9 +344,8 @@ class DSAutomator:
         # 2. 动态获取角色信息
         role_info = self._build_act_role_info()
         
-        body = {
+        base_body = {
             "actId": self.act_id,
-            "asIdList": task_as_ids,
             "asType": 4,
             # 动态角色信息
             "roleLevel": role_info.get("roleLevel", 0),
@@ -331,8 +360,23 @@ class DSAutomator:
             "visibleOSType": "ANDROID",
             "visiblePrdType": "MINI_PROGRAM"
         }
-        res = self.request("POST", "/v1/miniapp/act/task/taskInfo", body)
-        return res.get("result", {}).get("taskList", [])
+
+        all_tasks: List[Dict[str, Any]] = []
+        seen_task_ids: set = set()
+        for as_id in task_as_ids:
+            body = base_body.copy()
+            body["asIdList"] = [as_id]
+            res = self.request("POST", "/v1/miniapp/act/task/taskInfo", body)
+            task_list = (res.get("result") or {}).get("taskList") or []
+            for t in task_list:
+                task_id = t.get("asId") or t.get("id")
+                if task_id and task_id in seen_task_ids:
+                    continue
+                if task_id:
+                    seen_task_ids.add(task_id)
+                all_tasks.append(t)
+
+        return all_tasks
 
     def get_draw_info(self, luck_draw_as_id=None):
         luck_draw_as_id = luck_draw_as_id or self.luck_draw_as_id
@@ -342,7 +386,9 @@ class DSAutomator:
             "asType": 2,
             "appKey": self.app_key,
             "roleId": self.role_id,
-            "server": self.server
+            "server": self.server,
+            "visibleOSType": "ANDROID",
+            "visiblePrdType": "MINI_PROGRAM",
         }
         res = self.request("POST", "/v1/miniapp/act/module/luckDraw/luckDrawInfo", body)
         return res.get("result", {})
@@ -471,7 +517,9 @@ class DSAutomator:
             "asType": 2,
             "appKey": self.app_key,
             "roleId": self.role_id,
-            "server": self.server
+            "server": self.server,
+            "visibleOSType": "ANDROID",
+            "visiblePrdType": "MINI_PROGRAM",
         }
         res = self.request("POST", "/v1/miniapp/act/module/luckDraw/draw", body)
         return res.get("result", {})
@@ -496,7 +544,7 @@ def parse_accounts_from_env() -> List[Tuple[str, str, str, str]]:
         parts = line.split(sep)
         
         if len(parts) < 3:
-            print(f"[警告] 第{idx}行账号格式错误，至少需要 TOKEN{sep}UID{sep}DEVICE_ID: {line[:30]}...")
+            print(f"[警告] 第{idx}行账号格式错误，至少需要 TOKEN{sep}UID{sep}DEVICE_ID")
             continue
         
         token = parts[0].strip()
@@ -583,6 +631,11 @@ if __name__ == "__main__":
 
         # 抽奖
         print(f"\n[{nick}] --- 开始抽奖 ---")
+        if not bot.luck_draw_as_id:
+            print(f"[{nick}] 未获取到抽奖模块ID(asId)，跳过抽奖")
+            return
+        print(f"[{nick}] 抽奖模块 asId: {bot.luck_draw_as_id}")
+        win_prizes: List[str] = []
         while True:
             draw_info = bot.get_draw_info()
             chances = draw_info.get('myLeftDrawChance', 0)
@@ -593,10 +646,18 @@ if __name__ == "__main__":
             res = bot.draw()
             if res.get("isWin"):
                 prize = res.get("winPrize", {})
-                print(f"恭喜！抽到: {prize.get('prizeName')}")
+                prize_name = prize.get("prizeName") or prize.get("name") or "未知奖品"
+                win_prizes.append(prize_name)
+                print(f"恭喜！抽到: {prize_name}")
             else:
                 print("此次未中奖。")
             time.sleep(1)
+
+        if win_prizes:
+            send_notify(
+                f"集卡抽奖中奖 - {nick}",
+                "抽到:\n" + "\n".join(f"- {p}" for p in win_prizes),
+            )
 
         # 显示卡片状态
         print(f"\n[{nick}] --- 卡片状态 ---")
