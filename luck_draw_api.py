@@ -393,6 +393,17 @@ class DSAutomator:
         res = self.request("POST", "/v1/miniapp/act/module/luckDraw/luckDrawInfo", body)
         return res.get("result", {})
 
+    def visit_activity(self, card_as_id=None):
+        card_as_id = card_as_id or self.card_as_id
+        if not self.act_id or not card_as_id:
+            return {}
+        body = {
+            "actId": self.act_id,
+            "asId": card_as_id,
+            "asType": 43
+        }
+        return self.request("POST", "/v1/miniapp/act/module/interchgCard/collectInfo", body)
+
     def get_my_cards(self, card_as_id=None):
         card_as_id = card_as_id or self.card_as_id
         body = {
@@ -615,13 +626,28 @@ if __name__ == "__main__":
 
         # 执行任务
         print(f"\n[{nick}] --- 任务列表 ---")
+        def is_visit_activity_task(task: Dict[str, Any]) -> bool:
+            title = (task.get("title") or "")
+            return "访问" in title and "活动" in title
+
+        def is_send_card_task(task: Dict[str, Any]) -> bool:
+            title = (task.get("title") or "")
+            return "\u9001\u51fa" in title and "\u5361" in title
+
         tasks = bot.get_tasks()
+        if any(is_visit_activity_task(t) and not t.get("completed") for t in tasks):
+            bot.visit_activity()
+            tasks = bot.get_tasks()
         for task in tasks:
+            if task.get("alreadyGot"):
+                continue
             status = "已完成" if task.get("completed") else "未开始"
             reward_got = "已领取" if task.get("alreadyGot") else "未领取"
             print(f"任务: {task.get('title')} | 状态: {status} | 奖励: {reward_got}")
             
             if not task.get("completed"):
+                if is_send_card_task(task):
+                    continue
                 do_res = bot.do_task(task.get("asId"))
                 print(f"  -> 任务执行: {do_res.get('errmsg', '成功')}")
                 
@@ -772,15 +798,7 @@ if __name__ == "__main__":
     # 创建所有 bot 实例
     bots = [create_bot(acc) for acc in ACCOUNTS]
 
-    # 1. 先执行每个账号的每日任务
-    for bot in bots:
-        try:
-            run_daily_tasks(bot)
-        except Exception as e:
-            print(f"[{bot.name}] 执行任务出错: {e}")
-        time.sleep(2)
-
-    # 2. 按组配对互相赠送卡片 (1-2, 3-4, 5-6 ...)
+    # 1. 按组配对互相赠送卡片 (1-2, 3-4, 5-6 ...)
     if EXCHANGE_CARDS:
         print(f"\n\n{'#'*60}")
         print("# 开始配对互相赠送卡片")
@@ -800,6 +818,14 @@ if __name__ == "__main__":
             print(f"\n[提示] {bots[-1].name} 是奇数账号，没有配对对象")
     else:
         print(f"\n\n[提示] 互赠卡片功能已关闭 (NARAKA_EXCHANGE_CARDS=False)")
+
+    # 2. 再执行每个账号的每日任务
+    for bot in bots:
+        try:
+            run_daily_tasks(bot)
+        except Exception as e:
+            print(f"[{bot.name}] 执行任务出错: {e}")
+        time.sleep(2)
 
     print(f"\n{'='*60}")
     print("所有账号处理完成！")
