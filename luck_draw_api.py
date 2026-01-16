@@ -650,6 +650,12 @@ if __name__ == "__main__":
                     continue
                 do_res = bot.do_task(task.get("asId"))
                 print(f"  -> 任务执行: {do_res.get('errmsg', '成功')}")
+                # 执行任务后立即尝试领取奖励（任务可能已完成）
+                time.sleep(0.5)
+                prize_res = bot.apply_prize(task.get("asId"))
+                if prize_res.get('code') == 200:
+                    print(f"  -> 奖励领取: OK")
+                continue
                 
             if task.get("completed") and not task.get("alreadyGot"):
                 prize_res = bot.apply_prize(task.get("asId"))
@@ -681,8 +687,8 @@ if __name__ == "__main__":
 
         if win_prizes:
             send_notify(
-                f"集卡抽奖中奖 - {nick}",
-                "抽到:\n" + "\n".join(f"- {p}" for p in win_prizes),
+                "集卡抽奖中奖",
+                f"{nick}抽到:\n" + "\n".join(f"- {p}" for p in win_prizes),
             )
 
         # 显示卡片状态
