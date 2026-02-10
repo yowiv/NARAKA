@@ -26,6 +26,13 @@ except Exception:
     notify_send = None
 
 # =============================================================================
+# 模块类型常量（网易大神小程序固定协议）
+# =============================================================================
+AS_TYPE_DRAW = 2      # 抽奖模块
+AS_TYPE_TASK = 4      # 任务模块
+AS_TYPE_CARD = "43"   # 集卡模块（API要求字符串格式）
+
+# =============================================================================
 # 配置
 # =============================================================================
 # 签名计算 API 地址（Cloudflare Worker）
@@ -79,7 +86,7 @@ class DSAutomator:
             "GL-DeviceId": self.device_id,
             "GL-Token": self.token,
             "GL-Uid": self.uid,
-            "Referer": "https://servicewechat.com/wx53eacbe0d8a7a95a/324/page-frame.html"
+            "Referer": "https://servicewechat.com/wx53eacbe0d8a7a95a/329/page-frame.html"
         }
 
     def _get_sign_from_api(self, body_str: str) -> Optional[Dict[str, str]]:
@@ -113,8 +120,15 @@ class DSAutomator:
             print(f"[签名API] 请求失败: {e}")
             return None
 
-    def request(self, method: str, endpoint: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        """发起请求，签名通过远程 API 计算"""
+    def request(self, method: str, endpoint: str, body: Dict[str, Any], silent: bool = False) -> Dict[str, Any]:
+        """发起请求，签名通过远程 API 计算
+        
+        Args:
+            method: HTTP 方法
+            endpoint: API 端点
+            body: 请求体
+            silent: 是否静默模式（不输出错误日志）
+        """
         url = f"{self.base_url}{endpoint}"
         body_str = json.dumps(body, separators=(',', ':'))
         
@@ -129,7 +143,7 @@ class DSAutomator:
         
         response = self.session.request(method, url, data=body_str, headers=headers)
         res_json = response.json()
-        if res_json.get("code") != 200:
+        if res_json.get("code") != 200 and not silent:
             print(f"请求失败 [{endpoint}]: {res_json.get('errmsg', '未知错误')}")
         return res_json
 
@@ -150,9 +164,11 @@ class DSAutomator:
         # 2. 自动发现卡册ID（如未配置）
         global CARD_BOOK_ID, _CARD_BOOK_ID_AUTO_LOGGED
         if not CARD_BOOK_ID:
+            print(f"[{self.name}] 尝试动态获取卡册ID...")
             discovered = self.discover_latest_card_book_id()
             if not discovered:
-                print(f"[{self.name}] 初始化失败: 无法自动发现卡册ID（请稍后重试或手动设置 NARAKA_CARD_BOOK_ID）")
+                print(f"[{self.name}] 初始化失败: 所有方式均无法发现卡册ID，可能当前没有进行中的集卡活动")
+                print(f"[{self.name}] 提示: 可手动设置 NARAKA_CARD_BOOK_ID 或等待新活动开始")
                 return False
             CARD_BOOK_ID = discovered
             if not _CARD_BOOK_ID_AUTO_LOGGED:
@@ -187,23 +203,157 @@ class DSAutomator:
     def discover_latest_card_book_id(self) -> str:
         """
         自动获取最新卡册ID。
-
-        通过 cardBookInfos 拉取卡册列表，取第一页第一条作为“最新卡册”。
+        尝试多种方式，参考 monthly_signin 的多重回退策略。
         """
-        body = {
-            "appKey": self.app_key or "d90",
+        # 方式1【主要】：通过 cardBookInfos 获取当前游戏的卡册
+        book_id = self._discover_from_card_book_infos(self.app_key or "d90")
+        if book_id:
+            print(f"[{self.name}] 从卡册列表(d90)找到卡册ID: {book_id[:16]}...")
+            return book_id
+
+        # 方式2：不限游戏，获取所有游戏的卡册
+        book_id = self._discover_from_card_book_infos(None)
+        if book_id:
+            print(f"[{self.name}] 从卡册列表(全部游戏)找到卡册ID: {book_id[:16]}...")
+            return book_id
+
+        # 方式3：通过 cardBookGameList 获取有卡册的游戏，再逐个查询
+        book_id = self._discover_from_game_list()
+        if book_id:
+            print(f"[{self.name}] 从卡册游戏列表找到卡册ID: {book_id[:16]}...")
+            return book_id
+
+        # 方式4：通过静态配置获取
+        book_id = self._discover_from_static_config()
+        if book_id:
+            print(f"[{self.name}] 从静态配置找到卡册ID: {book_id[:16]}...")
+            return book_id
+
+        # 方式5：通过福利中心游戏信息获取
+        book_id = self._discover_from_welfare_info()
+        if book_id:
+            print(f"[{self.name}] 从福利中心找到卡册ID: {book_id[:16]}...")
+            return book_id
+
+        return ""
+
+    def _discover_from_card_book_infos(self, app_key: Optional[str]) -> str:
+        """通过 cardBookInfos 接口获取卡册ID"""
+        body: Dict[str, Any] = {
             "pageNum": 0,
-            "pageSize": 1
+            "pageSize": 10
         }
-        res = self.request("POST", "/v1/miniapp/act/module/interchgCard/cardBookInfos", body)
+        if app_key:
+            body["appKey"] = app_key
+        res = self.request("POST", "/v1/miniapp/act/module/interchgCard/cardBookInfos", body, silent=True)
         result = res.get("result") or {}
         books = result.get("books") or []
-        if not books:
-            return ""
+        # 优先找进行中的卡册
+        now_ms = int(time.time() * 1000)
+        for book in books:
+            base_info = book.get("baseInfo") or {}
+            end_time = base_info.get("endTime") or 0
+            book_id = (base_info.get("id") or book.get("id") or "").strip()
+            if book_id and (not end_time or end_time > now_ms):
+                return book_id
+        # 没有进行中的，取第一个
+        if books:
+            book0 = books[0] or {}
+            base_info = book0.get("baseInfo") or {}
+            return (base_info.get("id") or book0.get("id") or "").strip()
+        return ""
 
-        book0 = books[0] or {}
-        base_info = book0.get("baseInfo") or {}
-        return (base_info.get("id") or book0.get("id") or "").strip()
+    def _discover_from_game_list(self) -> str:
+        """通过 cardBookGameList 获取有卡册活动的游戏，再查询各游戏的卡册"""
+        res = self.request("POST", "/v1/miniapp/act/module/interchgCard/cardBookGameList", {}, silent=True)
+        result = res.get("result")
+        game_list = []
+        if isinstance(result, list):
+            game_list = result
+        elif isinstance(result, dict):
+            game_list = result.get("gameList") or result.get("list") or []
+        # 优先查 d90
+        d90_first = sorted(game_list, key=lambda g: (0 if g.get("appKey") == "d90" else 1))
+        for game in d90_first:
+            app_key = game.get("appKey") or ""
+            if not app_key:
+                continue
+            book_id = self._discover_from_card_book_infos(app_key)
+            if book_id:
+                return book_id
+        return ""
+
+    def _discover_from_static_config(self) -> str:
+        """通过静态配置接口获取卡册ID"""
+        body = {
+            "moduleNameList": ["DS_MINI_PROGRAM_CARD_BOOK_LIST_DATA"]
+        }
+        try:
+            res = self.request("POST", "/v1/miniapp/static/conf/getByModuleNameList", body, silent=True)
+            result = res.get("result")
+            if isinstance(result, list):
+                for cfg in result:
+                    if cfg is None:
+                        continue
+                    item = cfg.get("item") or "{}"
+                    if isinstance(item, str):
+                        try:
+                            item = json.loads(item)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                    if isinstance(item, dict):
+                        # 可能包含 cardBookId 或其他相关字段
+                        book_id = item.get("cardBookId") or item.get("id") or ""
+                        if book_id:
+                            return str(book_id).strip()
+        except Exception:
+            pass
+        return ""
+
+    def _discover_from_welfare_info(self) -> str:
+        """通过福利中心接口获取集卡活动的卡册ID"""
+        square_id = "5fd31fbdd54568442dc5cd5d"  # 永劫无间
+        body = {
+            "squareId": square_id,
+            "pageType": "WELFARE"
+        }
+        try:
+            res = self.request("POST", "/v1/miniapp/ws/game/info/v2", body, silent=True)
+            result = res.get("result") or {}
+            # 检查 wsSubGameInfoList 中是否有集卡入口
+            sub_list = result.get("wsSubGameInfoList") or []
+            for sub in sub_list:
+                entry_type = sub.get("entryType") or ""
+                sub_name = sub.get("name") or sub.get("title") or ""
+                # 集卡活动通常有 cardBookId 或 params 中带 id
+                params = sub.get("params") or {}
+                if isinstance(params, str):
+                    try:
+                        params = json.loads(params)
+                    except (json.JSONDecodeError, ValueError):
+                        params = {}
+                book_id = params.get("cardBookId") or params.get("id") or ""
+                if book_id and ("集卡" in sub_name or "卡册" in sub_name or entry_type == "collect-card"):
+                    return str(book_id).strip()
+            # 检查 configList
+            config_list = result.get("configList") or []
+            for cfg in config_list:
+                cfg_type = cfg.get("type") or cfg.get("configType") or ""
+                cfg_name = cfg.get("name") or cfg.get("title") or ""
+                if "集卡" in cfg_name or "card" in cfg_type.lower() or "collect" in cfg_type.lower():
+                    params = cfg.get("params") or cfg.get("config") or {}
+                    if isinstance(params, str):
+                        try:
+                            params = json.loads(params)
+                        except (json.JSONDecodeError, ValueError):
+                            params = {}
+                    if isinstance(params, dict):
+                        book_id = params.get("cardBookId") or params.get("id") or ""
+                        if book_id:
+                            return str(book_id).strip()
+        except Exception:
+            pass
+        return ""
 
     def get_card_book_config(self) -> Optional[Dict[str, Any]]:
         """
@@ -346,7 +496,7 @@ class DSAutomator:
         
         base_body = {
             "actId": self.act_id,
-            "asType": 4,
+            "asType": AS_TYPE_TASK,
             # 动态角色信息
             "roleLevel": role_info.get("roleLevel", 0),
             "serverName": role_info.get("serverName", ""),
@@ -383,7 +533,7 @@ class DSAutomator:
         body = {
             "actId": self.act_id,
             "asId": luck_draw_as_id,
-            "asType": 2,
+            "asType": AS_TYPE_DRAW,
             "appKey": self.app_key,
             "roleId": self.role_id,
             "server": self.server,
@@ -400,7 +550,7 @@ class DSAutomator:
         body = {
             "actId": self.act_id,
             "asId": card_as_id,
-            "asType": 43
+            "asType": AS_TYPE_CARD
         }
         return self.request("POST", "/v1/miniapp/act/module/interchgCard/collectInfo", body)
 
@@ -409,7 +559,7 @@ class DSAutomator:
         body = {
             "actId": self.act_id,
             "asId": card_as_id,
-            "asType": 43, 
+            "asType": AS_TYPE_CARD, 
             "appKey": self.app_key,
             "roleId": self.role_id,
             "server": self.server
@@ -417,9 +567,71 @@ class DSAutomator:
         res = self.request("POST", "/v1/miniapp/act/module/interchgCard/myCard", body)
         return res.get("result", {})
 
+    def receive_milepost(self, node_id: str, card_as_id=None) -> Dict[str, Any]:
+        """
+        领取里程碑奖励（集齐N张卡后的奖励）。
+        
+        Args:
+            node_id: 里程碑节点ID
+            card_as_id: 卡片活动模块ID
+            
+        Returns:
+            领取结果，包含 winPrizeList 等信息
+        """
+        card_as_id = card_as_id or self.card_as_id
+        body = {
+            "asType": AS_TYPE_CARD,
+            "actId": self.act_id,
+            "asId": card_as_id,
+            "nodeId": node_id
+        }
+        # 使用静默模式，避免"已领取"错误刷屏
+        res = self.request("POST", "/v1/miniapp/act/module/interchgCard/receiveMilepost", body, silent=True)
+        return res
+
+    def claim_all_milepost_rewards(self) -> List[str]:
+        """
+        领取所有可领取的里程碑奖励。
+        
+        Returns:
+            领取到的奖品名称列表
+        """
+        card_data = self.get_my_cards()
+        milepost_infos = card_data.get('milepostInfos', [])
+        prizes_claimed = []
+        
+        for milepost in milepost_infos:
+            state = milepost.get('state', '')
+            node_id = milepost.get('nodeId', '')
+            title = milepost.get('title', '')
+            
+            # 状态说明：
+            # - RECEIVE = 已领取
+            # - UN_RECEIVE = 可领取（达到条件但未领取）
+            # - UN_COMPLETE = 未达成条件
+            if state != 'UN_RECEIVE' or not node_id:
+                continue
+            
+            res = self.receive_milepost(node_id)
+            if res.get('code') == 200:
+                print(f"  领取里程碑奖励: {title}")
+                win_prizes = res.get('result', {}).get('winPrizeList', [])
+                for prize in win_prizes:
+                    prize_name = prize.get('prizeName', '未知奖品')
+                    prizes_claimed.append(prize_name)
+                    print(f"    -> 获得: {prize_name}")
+            else:
+                # 如果是"已领取"错误，静默跳过；其他错误才输出
+                errmsg = res.get('errmsg', '')
+                if '已经领取' not in errmsg and '已领取' not in errmsg:
+                    print(f"  [{title}] 领取失败: {errmsg}")
+            time.sleep(0.3)
+        
+        return prizes_claimed
+
     def share_card(self):
         body = {
-            "asType": 43,
+            "asType": AS_TYPE_CARD,
             "asId": self.card_as_id,
             "actId": self.act_id
         }
@@ -436,7 +648,7 @@ class DSAutomator:
             包含 interchangeWishId 的结果，用于接收方领取
         """
         body = {
-            "asType": 43,
+            "asType": AS_TYPE_CARD,
             "actId": self.act_id,
             "asId": self.card_as_id,
             "cardId": card_id
@@ -455,7 +667,7 @@ class DSAutomator:
             领取结果
         """
         body = {
-            "asType": 43,
+            "asType": AS_TYPE_CARD,
             "actId": self.act_id,
             "asId": self.card_as_id,
             "interchangeWishId": wish_id
@@ -501,7 +713,7 @@ class DSAutomator:
         body = {
             "actId": self.act_id,
             "asIdList": [task_as_id],
-            "asType": 4,
+            "asType": AS_TYPE_TASK,
             "appKey": self.app_key,
             "roleId": self.role_id,
             "server": self.server
@@ -513,7 +725,7 @@ class DSAutomator:
         body = {
             "actId": self.act_id,
             "asId": task_as_id,
-            "asType": 4,
+            "asType": AS_TYPE_TASK,
             "appKey": self.app_key,
             "roleId": self.role_id,
             "server": self.server
@@ -525,7 +737,7 @@ class DSAutomator:
         body = {
             "actId": self.act_id,
             "asId": luck_draw_as_id,
-            "asType": 2,
+            "asType": AS_TYPE_DRAW,
             "appKey": self.app_key,
             "roleId": self.role_id,
             "server": self.server,
@@ -699,6 +911,18 @@ if __name__ == "__main__":
         missing = [c.get('name') for c in card_infos if (c.get('num') or 0) == 0]
         print(f"已拥有: {', '.join(owned) if owned else '无'}")
         print(f"缺少: {', '.join(missing) if missing else '无'}")
+
+        # 领取里程碑奖励
+        print(f"\n[{nick}] --- 领取里程碑奖励 ---")
+        milepost_prizes = bot.claim_all_milepost_rewards()
+        if milepost_prizes:
+            print(f"里程碑奖励: {', '.join(milepost_prizes)}")
+            send_notify(
+                "集卡里程碑奖励",
+                f"{nick}领取了:\n" + "\n".join(f"- {p}" for p in milepost_prizes),
+            )
+        else:
+            print("暂无可领取的里程碑奖励")
 
     def pair_exchange_cards(bot_a: DSAutomator, bot_b: DSAutomator):
         """
